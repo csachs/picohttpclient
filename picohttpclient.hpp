@@ -218,7 +218,7 @@ struct HTTPClient {
 
     string request =
       string(method2string(method)) + 
-      string(" /") + uri.address + " HTTP/1.1" HTTP_NEWLINE
+      string(" /") + uri.address + ((uri.querystring == "") ? "" : "?") + uri.querystring + " HTTP/1.1" HTTP_NEWLINE
       "Host: " + uri.host + HTTP_NEWLINE
       "Accept: */*" HTTP_NEWLINE
       "Connection: close" HTTP_NEWLINE
