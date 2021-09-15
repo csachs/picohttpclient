@@ -1,7 +1,7 @@
 /*
   picohttpclient.hpp ... generic, lightweight HTTP 1.1 client
 
-  ... no complex features, no chunking, no ssl, no keepalive ...
+  ... no complex features, no chunking, no keepalive ...
   ... not very tested, use at your own risk!
   ... it PURPOSELY does not use any feature-complete libraries
       (like cURL) to stay lean and header-only.
@@ -44,9 +44,12 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
-// possibly add SSL?
-// https://wiki.openssl.org/index.php/SSL/TLS_Client
+#ifdef PICOHTTP_SSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 
+#include <iostream>
 using namespace std;
 
 class tokenizer {
@@ -126,15 +129,16 @@ struct HTTPResponse {
   string protocol;
   string response;
   string responseString;
-
+  string errorMsg;
   stringMap header;
 
   string body;
 
   inline HTTPResponse() : success(true){};
-  inline static HTTPResponse fail() {
+  inline static HTTPResponse fail(const string &msg="") {
     HTTPResponse result;
     result.success = false;
+    result.errorMsg = msg;
     return result;
   }
 };
@@ -167,6 +171,11 @@ struct HTTPClient {
 
     if (uri.port == "") {
       uri.port = "80";
+#ifdef PICOHTTP_SSL
+      if(uri.protocol.compare("https") == 0) {
+        uri.port = "443";
+      }
+#endif
     }
 
     int getaddrinfo_result =
@@ -202,7 +211,11 @@ struct HTTPClient {
     return fd;
   };
 
-  inline static string bufferedRead(int fd) {
+#ifdef PICOHTTP_SSL
+  inline static string bufferedRead(SSL* ssl, int fd) {
+#else
+  inline static string bufferedRead(int fd) { 
+#endif
     size_t initial_factor = 4, buffer_increment_size = 8192, buffer_size = 0,
            bytes_read = 0;
     string buffer;
@@ -210,9 +223,18 @@ struct HTTPClient {
     buffer.resize(initial_factor * buffer_increment_size);
 
     do {
-      bytes_read = read(fd, ((char *)buffer.c_str()) + buffer_size,
-                        buffer.size() - buffer_size);
-
+#ifdef PICOHTTP_SSL
+       if(ssl == nullptr) {
+#endif
+	bytes_read = read(fd, ((char *)buffer.c_str()) + buffer_size,
+                          buffer.size() - buffer_size);
+#ifdef PICOHTTP_SSL
+	} else {
+	    bytes_read = SSL_read(ssl, ((char *)buffer.c_str()) + buffer_size,
+                          buffer.size() - buffer_size);
+	}
+#endif
+      
       buffer_size += bytes_read;
 
       if (bytes_read > 0 &&
@@ -230,22 +252,75 @@ struct HTTPClient {
 #define HTTP_SPACE " "
 #define HTTP_HEADER_SEPARATOR ": "
 
-    int fd = connectToURI(uri);
-    if (fd < 0)
-      return HTTPResponse::fail();
+#ifdef PICOHTTP_SSL
+    const bool is_ssl = uri.protocol.compare("https") == 0;
+    SSL_CTX *ctx = nullptr;
+    SSL *ssl = nullptr;
+    
+    if(is_ssl) {
+        const SSL_METHOD *sslmethod = TLS_client_method();
+        ctx = SSL_CTX_new(sslmethod);
+        if(ctx == nullptr) {
+          return HTTPResponse::fail("ssl context initialization failed");
+        }
+        ssl = SSL_new(ctx);
+        if(ssl == nullptr) {
+            return HTTPResponse::fail("ssl initialization failed");
+        }
+    }
+#endif
 
+    int fd = connectToURI(uri);
+
+    if (fd < 0)
+      return HTTPResponse::fail("could not open tcp socket");
+
+#ifdef PICOHTTP_SSL
+    if(ssl != nullptr) {
+        SSL_set_fd(ssl, fd);
+        const int connstatus = SSL_connect(ssl);
+        if(connstatus != 1) {
+          return HTTPResponse::fail("SSL_connect failed (code " + to_string(connstatus) + ")");
+        }
+    }
+#endif
+    
     string request = string(method2string(method)) + string(" /") +
                      uri.address + ((uri.querystring == "") ? "" : "?") +
                      uri.querystring + " HTTP/1.1" HTTP_NEWLINE "Host: " +
                      uri.host + HTTP_NEWLINE
                      "Accept: */*" HTTP_NEWLINE
                      "Connection: close" HTTP_NEWLINE HTTP_NEWLINE;
-
+#ifdef PICOHTTP_SSL
+    int bytes_written;
+    if(ssl != nullptr) {
+      bytes_written = SSL_write(ssl, request.c_str(), request.size());
+    } else {
+      bytes_written = write(fd, request.c_str(), request.size());
+    }
+#else
     int bytes_written = write(fd, request.c_str(), request.size());
+#endif
 
+#ifdef PICOHTTP_SSL
+    string buffer = bufferedRead(ssl, fd);
+#else
     string buffer = bufferedRead(fd);
+#endif
+
+#ifdef PICOHTTP_SSL
+    if(ssl != nullptr) {
+      SSL_free(ssl);
+    }
+#endif
 
     close(fd);
+
+#ifdef PICOHTTP_SSL
+    if(ctx != nullptr) {
+      SSL_CTX_free(ctx);
+    }
+#endif
 
     HTTPResponse result;
 
